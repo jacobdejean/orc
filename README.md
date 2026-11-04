@@ -52,23 +52,34 @@ Currently loads https://example.com.
   `Contents/Frameworks -> ../..` symlink.
 - The app cannot run under this repo's terminal sandbox (process spawning /
   WindowServer access gets SIGABRT with no output) — run it normally.
+- Browser close is a multi-stage dance (see the `DoClose` docs in
+  `cef_life_span_handler.h`): the browser's teardown is only triggered by
+  DESTRUCTION of its native view, and an `NSWindow` close merely hides the
+  window. `windowShouldClose:` therefore calls `TryCloseBrowser()`, returns
+  its result as the allow/deny answer, and — when proceeding — explicitly
+  removes the browser view from its superview to complete the teardown.
+  Without that, `OnBeforeClose` never fires and the app can't quit.
+- Launching a second instance while one is running prints "Opening in
+  existing browser session" and exits — quit events then appear to do
+  nothing. `pkill -f Experiment.app` before testing quit behavior.
 
 ## Roadmap
 
 1. ~~CEF renders a page fullscreen in a bare NSWindow~~ ✔
 2. ~~OS-level menus (Edit for copy/paste, View for reload/devtools), clean
    quit path, window resizing, popup policy, cache path, mock keychain~~ ✔
-3. Native chrome: sidebar / tab strip / URL field as sibling NSViews,
-   resizing the CEF view
-4. Multiple tabs (multiple `CefBrowser` instances, swap visible view)
-5. Polish / styling
-6. (Later) consider a Rust port for safety, once the CEF lifecycle and macOS
+3. ~~Native chrome, step 1: toolbar (back/forward/reload + URL field) wired
+   to CEF navigation and load/address/title callbacks~~ ✔
+4. Native chrome, step 2: sidebar / tab strip as sibling NSViews
+5. Multiple tabs (multiple `CefBrowser` instances, swap visible view)
+6. Polish / styling
+7. (Later) consider a Rust port for safety, once the CEF lifecycle and macOS
    bundle requirements are fully understood here.
 
 ## Tech-debt watchlist (revisit as the experiment grows)
 
 - `g_first_browser` / `GetFirstBrowserForTesting` global — replace with a
-  browser registry when tabs land (milestone 4).
+  browser registry when tabs land (milestone 5). Same for `g_toolbar`.
 - `ExperimentAppDelegate` is accumulating "native UI → CEF" actions; promote
   to a BrowserController once the tab strip exists.
 - `settings.no_sandbox = true` — fine locally, must change before any

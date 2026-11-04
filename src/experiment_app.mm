@@ -8,6 +8,8 @@
 #include "include/views/cef_window.h"
 #include "include/wrapper/cef_helpers.h"
 
+#include "toolbar.h"
+
 namespace {
 
 // Parent NSView* for the web content, set by main.mm before CefInitialize.
@@ -101,11 +103,41 @@ void ExperimentClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   }
   browser_count_++;
 
-  // Let the web content view follow window resizes.
+  // Let the web content view follow window resizes, leaving room for the
+  // toolbar pinned to the top of the contentView.
   NSView* browserView =
       (__bridge NSView*)browser->GetHost()->GetWindowHandle();
   [browserView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  [browserView setFrame:[[browserView superview] bounds]];
+  NSRect bounds = [[browserView superview] bounds];
+  [browserView setFrame:NSMakeRect(0, 0, bounds.size.width,
+                                   bounds.size.height - kToolbarHeight)];
+}
+
+void ExperimentClient::OnAddressChange(CefRefPtr<CefBrowser> browser,
+                                       CefRefPtr<CefFrame> frame,
+                                       const CefString& url) {
+  CEF_REQUIRE_UI_THREAD();
+  if (frame->IsMain()) {
+    ToolbarSetAddressText(url.ToString());
+  }
+}
+
+void ExperimentClient::OnTitleChange(CefRefPtr<CefBrowser> browser,
+                                     const CefString& title) {
+  CEF_REQUIRE_UI_THREAD();
+  NSView* browserView =
+      (__bridge NSView*)browser->GetHost()->GetWindowHandle();
+  NSString* nsTitle =
+      [NSString stringWithUTF8String:title.ToString().c_str()];
+  [[browserView window] setTitle:nsTitle ?: @"Experiment"];
+}
+
+void ExperimentClient::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
+                                            bool isLoading,
+                                            bool canGoBack,
+                                            bool canGoForward) {
+  CEF_REQUIRE_UI_THREAD();
+  ToolbarSetLoadingState(isLoading, canGoBack, canGoForward);
 }
 
 // static

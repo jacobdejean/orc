@@ -2,14 +2,22 @@
 
 #include "include/cef_app.h"
 #include "include/cef_client.h"
+#include "include/cef_display_handler.h"
 #include "include/cef_life_span_handler.h"
+#include "include/cef_load_handler.h"
 
-// Minimal browser client: owns the browser lifecycle callbacks.
-class ExperimentClient : public CefClient, public CefLifeSpanHandler {
+// Minimal browser client: owns the browser lifecycle callbacks plus the
+// display/load callbacks that drive the native toolbar.
+class ExperimentClient : public CefClient,
+                         public CefLifeSpanHandler,
+                         public CefDisplayHandler,
+                         public CefLoadHandler {
  public:
   ExperimentClient() = default;
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
 
   // Used by main.mm's window delegate to close the browser on window close.
   static CefRefPtr<CefBrowser> GetFirstBrowserForTesting();
@@ -31,6 +39,19 @@ class ExperimentClient : public CefClient, public CefLifeSpanHandler {
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
   bool DoClose(CefRefPtr<CefBrowser> browser) override;
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
+
+  // CefDisplayHandler:
+  void OnAddressChange(CefRefPtr<CefBrowser> browser,
+                       CefRefPtr<CefFrame> frame,
+                       const CefString& url) override;
+  void OnTitleChange(CefRefPtr<CefBrowser> browser,
+                     const CefString& title) override;
+
+  // CefLoadHandler:
+  void OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
+                            bool isLoading,
+                            bool canGoBack,
+                            bool canGoForward) override;
 
  private:
   int browser_count_ = 0;

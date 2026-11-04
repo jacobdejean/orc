@@ -6,6 +6,7 @@
 #include "include/wrapper/cef_library_loader.h"
 
 #include "experiment_app.h"
+#include "toolbar.h"
 
 // Set by main.mm before CefInitialize; consumed in OnContextInitialized.
 void SetParentViewForBrowser(void* view);
@@ -30,6 +31,153 @@ void SetParentViewForBrowser(void* view);
   [super sendEvent:event];
 }
 @end
+
+// Native toolbar: back/forward/reload buttons plus a URL field, pinned to
+// the top of the window. Talks to CEF through GetFirstBrowserForTesting,
+// same as the menu actions — both get absorbed into a real controller
+// class once the UI grows.
+@interface ExperimentToolbar : NSObject <NSTextFieldDelegate> {
+  NSVisualEffectView* bar_;
+  NSButton* backButton_;
+  NSButton* forwardButton_;
+  NSButton* reloadButton_;
+  NSTextField* addressField_;
+}
+- (NSView*)view;
+- (void)setAddressText:(NSString*)url;
+- (void)setLoadingState:(BOOL)loading
+             canGoBack:(BOOL)canGoBack
+          canGoForward:(BOOL)canGoForward;
+@end
+
+@implementation ExperimentToolbar
+
+- (instancetype)init {
+  if ((self = [super init])) {
+    bar_ = [[NSVisualEffectView alloc] init];
+    [bar_ setMaterial:NSVisualEffectMaterialHeaderView];
+    // Pinned to the top of the contentView (bottom-origin coordinates, so
+    // the MinY margin stays flexible).
+    [bar_ setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+
+    const CGFloat pad = 8;
+    const CGFloat buttonWidth = 32;
+    CGFloat x = pad;
+    backButton_ = [self makeButtonWithTitle:@"◀"
+                                     action:@selector(goBack:)
+                                      frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
+    x += buttonWidth + 4;
+    forwardButton_ = [self makeButtonWithTitle:@"▶"
+                                        action:@selector(goForward:)
+                                         frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
+    x += buttonWidth + 4;
+    reloadButton_ = [self makeButtonWithTitle:@"⟳"
+                                       action:@selector(reloadPage:)
+                                        frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
+    x += buttonWidth + pad;
+
+    const CGFloat fieldX = x;
+    addressField_ = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(fieldX, 6, 600, kToolbarHeight - 12)];
+    [addressField_ setBezelStyle:NSTextFieldRoundedBezel];
+    [addressField_ setPlaceholderString:@"Search or enter address"];
+    [addressField_ setTarget:self];
+    [addressField_ setAction:@selector(addressEntered:)];
+    // Stretch with the bar, keeping the trailing margin fixed.
+    [addressField_ setAutoresizingMask:NSViewWidthSizable];
+    [bar_ addSubview:addressField_];
+  }
+  return self;
+}
+
+- (NSButton*)makeButtonWithTitle:(NSString*)title
+                          action:(SEL)action
+                           frame:(NSRect)frame {
+  NSButton* button = [[NSButton alloc] initWithFrame:frame];
+  [button setTitle:title];
+  [button setBezelStyle:NSBezelStyleRegularSquare];
+  [button setTarget:self];
+  [button setAction:action];
+  [button setAutoresizingMask:NSViewMaxXMargin];
+  [bar_ addSubview:button];
+  return button;
+}
+
+- (NSView*)view {
+  return bar_;
+}
+
+- (void)setAddressText:(NSString*)url {
+  // Don't stomp on text the user is actively editing.
+  if ([addressField_ currentEditor] == nil) {
+    [addressField_ setStringValue:url];
+  }
+}
+
+- (void)setLoadingState:(BOOL)loading
+             canGoBack:(BOOL)canGoBack
+          canGoForward:(BOOL)canGoForward {
+  [backButton_ setEnabled:canGoBack];
+  [forwardButton_ setEnabled:canGoForward];
+  [reloadButton_ setTitle:loading ? @"✕" : @"⟳"];
+}
+
+- (void)goBack:(id)sender {
+  if (CefRefPtr<CefBrowser> browser =
+          ExperimentClient::GetFirstBrowserForTesting()) {
+    browser->GoBack();
+  }
+}
+
+- (void)goForward:(id)sender {
+  if (CefRefPtr<CefBrowser> browser =
+          ExperimentClient::GetFirstBrowserForTesting()) {
+    browser->GoForward();
+  }
+}
+
+- (void)reloadPage:(id)sender {
+  if (CefRefPtr<CefBrowser> browser =
+          ExperimentClient::GetFirstBrowserForTesting()) {
+    if (browser->IsLoading()) {
+      browser->StopLoad();
+    } else {
+      browser->Reload();
+    }
+  }
+}
+
+- (void)addressEntered:(id)sender {
+  std::string text = [[addressField_ stringValue] UTF8String];
+  if (text.empty()) {
+    return;
+  }
+  // Bare input gets treated as a URL with an https:// prefix. (Search
+  // engine fallback comes later with an actual omnibox.)
+  if (text.find("://") == std::string::npos) {
+    text = "https://" + text;
+  }
+  if (CefRefPtr<CefBrowser> browser =
+          ExperimentClient::GetFirstBrowserForTesting()) {
+    browser->GetMainFrame()->LoadURL(text);
+  }
+}
+
+@end
+
+// Toolbar bridge used by the CEF client (see toolbar.h).
+static ExperimentToolbar* g_toolbar = nil;
+
+void ToolbarSetAddressText(const std::string& url) {
+  [g_toolbar setAddressText:[NSString stringWithUTF8String:url.c_str()]];
+}
+
+void ToolbarSetLoadingState(bool is_loading, bool can_go_back,
+                            bool can_go_forward) {
+  [g_toolbar setLoadingState:is_loading
+                  canGoBack:can_go_back
+               canGoForward:can_go_forward];
+}
 
 // Handles app lifecycle (clean quit) and menu actions that talk to CEF.
 // NOTE: this object is where "native UI → browser command" wiring should
@@ -58,10 +206,23 @@ void SetParentViewForBrowser(void* view);
 - (BOOL)windowShouldClose:(NSWindow*)sender {
   if (CefRefPtr<CefBrowser> browser =
           ExperimentClient::GetFirstBrowserForTesting()) {
-    browser->GetHost()->CloseBrowser(false);
-  } else {
-    CefQuitMessageLoop();
+    // TryCloseBrowser returns true if the close will proceed immediately
+    // (window may close now) and false if it's delayed by JavaScript unload
+    // handlers (keep the window open; CEF re-triggers the close when ready).
+    if (browser->GetHost()->TryCloseBrowser()) {
+      // Complete the browser close by tearing down the view hierarchy
+      // ourselves. We can't rely on NSWindow destruction for this: closing
+      // only hides the window, and in practice the window leaks anyway, so
+      // the browser view would never be destroyed and OnBeforeClose would
+      // never fire.
+      NSView* browserView =
+          (__bridge NSView*)browser->GetHost()->GetWindowHandle();
+      [browserView removeFromSuperview];
+      return YES;
+    }
+    return NO;
   }
+  CefQuitMessageLoop();
   return NO;
 }
 
@@ -178,11 +339,25 @@ int main(int argc, char* argv[]) {
     [window setTitle:@"Experiment"];
     [window center];
     [window setDelegate:delegate];
+    // The browser's teardown (step 9 of the DoClose contract) is triggered
+    // by DESTRUCTION of the top-level window's view hierarchy, not merely
+    // by closing it. Default NSWindow close behavior only hides the window,
+    // which would leave the browser half-closed and OnBeforeClose would
+    // never fire. So: release-on-close, and don't hold our own strong ref.
+    [window setReleasedWhenClosed:YES];
 
     // The web content renders into this view. Native chrome (tab strip,
     // sidebar) will later be added as sibling subviews of the contentView.
     NSView* contentView = [window contentView];
     SetParentViewForBrowser(contentView);
+
+    // Toolbar strip across the top; the browser view is laid out below it
+    // in OnAfterCreated.
+    g_toolbar = [[ExperimentToolbar alloc] init];
+    NSView* toolbarView = [g_toolbar view];
+    [toolbarView setFrame:NSMakeRect(0, frame.size.height - kToolbarHeight,
+                                     frame.size.width, kToolbarHeight)];
+    [contentView addSubview:toolbarView];
 
     CefSettings settings;
     settings.no_sandbox = true;
@@ -211,6 +386,9 @@ int main(int argc, char* argv[]) {
 
     [window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    // Drop our ARC reference; NSApp's window list retains the window until
+    // it closes, at which point releasedWhenClosed lets it deallocate.
+    window = nil;
 
     CefRunMessageLoop();
     CefShutdown();
