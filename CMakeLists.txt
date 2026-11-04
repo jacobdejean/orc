@@ -73,6 +73,7 @@ endforeach()
 # ---------------------------------------------------------------------------
 add_executable(${APP_NAME} MACOSX_BUNDLE
   src/main.mm
+  src/sidebar.mm
   src/experiment_app.mm
   src/experiment_app.h
 )

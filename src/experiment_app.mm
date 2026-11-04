@@ -2,75 +2,44 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <map>
+
 #include "include/cef_browser.h"
 #include "include/cef_command_line.h"
-#include "include/views/cef_browser_view.h"
-#include "include/views/cef_window.h"
+#include "include/cef_parser.h"
 #include "include/wrapper/cef_helpers.h"
 
-#include "toolbar.h"
+#include "sidebar.h"
 
 namespace {
 
 // Parent NSView* for the web content, set by main.mm before CefInitialize.
 void* g_parent_view = nullptr;
 
-// First browser created; used by main.mm's window delegate. Replaced by a
-// proper browser registry once tabs exist.
-CefRefPtr<CefBrowser> g_first_browser;
+// --- Tab registry (UI thread only) -------------------------------------------
+std::map<int, CefRefPtr<CefBrowser>> g_tabs;
+int g_active_tab = -1;
+bool g_terminating = false;
 
-// When using the Views framework this creates a window hosting the browser.
-// (Not used yet — main.mm creates the NSWindow directly — but kept here as
-// the natural seam for the future chrome UI.)
-class ExperimentWindowDelegate : public CefWindowDelegate {
- public:
-  explicit ExperimentWindowDelegate(CefRefPtr<CefBrowserView> browser_view)
-      : browser_view_(browser_view) {}
+// One client instance shared by all tabs; keeps handler wiring trivial.
+CefRefPtr<ExperimentClient> g_client;
 
-  void OnWindowCreated(CefRefPtr<CefWindow> window) override {
-    window->AddChildView(browser_view_);
-    window->Show();
-  }
+// Lays out a browser's native view in the content area (right of the
+// sidebar, or full width when the sidebar is hidden) and sizes it to track
+// window resizes.
+void LayoutBrowserView(CefRefPtr<CefBrowser> browser) {
+  NSView* browserView =
+      (__bridge NSView*)browser->GetHost()->GetWindowHandle();
+  [browserView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  NSRect bounds = [[browserView superview] bounds];
+  CGFloat x = SidebarIsHidden() ? 0 : kSidebarWidth;
+  [browserView setFrame:NSMakeRect(x, 0, bounds.size.width - x,
+                                   bounds.size.height)];
+}
 
-  void OnWindowDestroyed(CefRefPtr<CefWindow> window) override {
-    browser_view_ = nullptr;
-  }
-
-  bool CanClose(CefRefPtr<CefWindow> window) override {
-    if (browser_view_ && browser_view_->GetBrowser()) {
-      browser_view_->GetBrowser()->GetHost()->TryCloseBrowser();
-    }
-    return true;
-  }
-
-  CefSize GetPreferredSize(CefRefPtr<CefView> view) override {
-    return {1200, 800};
-  }
-
- private:
-  CefRefPtr<CefBrowserView> browser_view_;
-
-  IMPLEMENT_REFCOUNTING(ExperimentWindowDelegate);
-  DISALLOW_COPY_AND_ASSIGN(ExperimentWindowDelegate);
-};
-
-class ExperimentBrowserViewDelegate : public CefBrowserViewDelegate {
- public:
-  ExperimentBrowserViewDelegate() = default;
-
-  bool OnPopupBrowserViewCreated(CefRefPtr<CefBrowserView> browser_view,
-                                 CefRefPtr<CefBrowserView> popup_browser_view,
-                                 bool is_devtools) override {
-    // Open popups in a new top-level window.
-    CefWindow::CreateTopLevelWindow(
-        new ExperimentWindowDelegate(popup_browser_view));
-    return true;
-  }
-
- private:
-  IMPLEMENT_REFCOUNTING(ExperimentBrowserViewDelegate);
-  DISALLOW_COPY_AND_ASSIGN(ExperimentBrowserViewDelegate);
-};
+NSView* BrowserNSView(CefRefPtr<CefBrowser> browser) {
+  return (__bridge NSView*)browser->GetHost()->GetWindowHandle();
+}
 
 }  // namespace
 
@@ -89,47 +58,91 @@ bool ExperimentClient::OnBeforePopup(
     CefRefPtr<CefDictionaryValue>& extra_info,
     bool* no_javascript_access) {
   CEF_REQUIRE_UI_THREAD();
-  // No tab/window management yet: open popups in the current view.
+  // Popups open as new tabs.
   if (!target_url.empty()) {
-    frame->LoadURL(target_url);
+    CreateTab(target_url.ToString());
   }
-  return true;  // Suppress the popup.
+  return true;  // Suppress the popup window.
 }
 
 void ExperimentClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
   CEF_REQUIRE_UI_THREAD();
-  if (!g_first_browser) {
-    g_first_browser = browser;
+  const int id = browser->GetIdentifier();
+  g_tabs[id] = browser;
+  LayoutBrowserView(browser);
+  SidebarTabAdded(id);
+  // New tabs take focus, Arc-style.
+  ActivateTab(id);
+  // A blank new tab wants a URL: focus the address field (typing replaces
+  // the selected "about:blank").
+  if (CefRefPtr<CefFrame> frame = browser->GetMainFrame()) {
+    if (frame->GetURL().ToString() == "about:blank") {
+      SidebarFocusAddressField();
+    }
   }
-  browser_count_++;
+}
 
-  // Let the web content view follow window resizes, leaving room for the
-  // toolbar pinned to the top of the contentView.
-  NSView* browserView =
-      (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-  [browserView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  NSRect bounds = [[browserView superview] bounds];
-  [browserView setFrame:NSMakeRect(0, 0, bounds.size.width,
-                                   bounds.size.height - kToolbarHeight)];
+bool ExperimentClient::DoClose(CefRefPtr<CefBrowser> browser) {
+  CEF_REQUIRE_UI_THREAD();
+  // Complete the browser close by tearing down the native view ourselves
+  // (step 9 of the DoClose contract): the browser's teardown is triggered by
+  // DESTRUCTION of its native view, so removing it from the view hierarchy
+  // here is what actually lets OnBeforeClose fire.
+  [BrowserNSView(browser) removeFromSuperview];
+  return false;  // Allow the close.
+}
+
+void ExperimentClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
+  CEF_REQUIRE_UI_THREAD();
+  const int id = browser->GetIdentifier();
+  const bool was_active = (id == g_active_tab);
+  g_tabs.erase(id);
+  SidebarTabRemoved(id);
+
+  if (was_active) {
+    g_active_tab = -1;
+    if (!g_tabs.empty()) {
+      // Activate the most recently created remaining tab.
+      ActivateTab(g_tabs.rbegin()->first);
+    }
+  }
+
+  if (g_tabs.empty()) {
+    StartViewSetVisible(true);
+    if (g_terminating) {
+      CefQuitMessageLoop();
+    }
+  }
 }
 
 void ExperimentClient::OnAddressChange(CefRefPtr<CefBrowser> browser,
                                        CefRefPtr<CefFrame> frame,
                                        const CefString& url) {
   CEF_REQUIRE_UI_THREAD();
-  if (frame->IsMain()) {
-    ToolbarSetAddressText(url.ToString());
+  if (frame->IsMain() && IsActive(browser)) {
+    SidebarSetAddressText(url.ToString());
   }
 }
 
 void ExperimentClient::OnTitleChange(CefRefPtr<CefBrowser> browser,
                                      const CefString& title) {
   CEF_REQUIRE_UI_THREAD();
-  NSView* browserView =
-      (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-  NSString* nsTitle =
-      [NSString stringWithUTF8String:title.ToString().c_str()];
-  [[browserView window] setTitle:nsTitle ?: @"Experiment"];
+  SidebarTabSetTitle(browser->GetIdentifier(), title.ToString());
+  if (IsActive(browser)) {
+    NSString* nsTitle =
+        [NSString stringWithUTF8String:title.ToString().c_str()];
+    [BrowserNSView(browser).window setTitle:nsTitle ?: @"Experiment"];
+  }
+}
+
+void ExperimentClient::OnFaviconURLChange(
+    CefRefPtr<CefBrowser> browser,
+    const std::vector<CefString>& icon_urls) {
+  CEF_REQUIRE_UI_THREAD();
+  if (!icon_urls.empty()) {
+    SidebarTabSetFaviconURL(browser->GetIdentifier(),
+                            icon_urls[0].ToString());
+  }
 }
 
 void ExperimentClient::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
@@ -137,27 +150,114 @@ void ExperimentClient::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
                                             bool canGoBack,
                                             bool canGoForward) {
   CEF_REQUIRE_UI_THREAD();
-  ToolbarSetLoadingState(isLoading, canGoBack, canGoForward);
+  if (IsActive(browser)) {
+    SidebarSetLoadingState(isLoading, canGoBack, canGoForward);
+  }
+}
+
+void ExperimentClient::OnLoadError(CefRefPtr<CefBrowser> browser,
+                                   CefRefPtr<CefFrame> frame,
+                                   ErrorCode errorCode,
+                                   const CefString& errorText,
+                                   const CefString& failedUrl) {
+  CEF_REQUIRE_UI_THREAD();
+  // Ignore aborted loads (user stopped the load, or a navigation raced this
+  // one) and sub-frame errors.
+  if (errorCode == ERR_ABORTED || !frame->IsMain()) {
+    return;
+  }
+  // Without this, a failed load just leaves a blank view. Show a minimal
+  // inline error page so the state is visible instead of silent.
+  std::string html =
+      "<html><body style='background:#1e1e1e;color:#ccc;font:14px "
+      "\"-apple-system\";display:flex;justify-content:center;padding-top:20%'>"
+      "<div><b>Page failed to load</b><br><br>" +
+      errorText.ToString() + "<br>" + failedUrl.ToString() +
+      "</div></body></html>";
+  // Percent-encode: a raw '#' would truncate the data URL at the fragment.
+  frame->LoadURL("data:text/html;charset=utf-8," +
+                 CefURIEncode(html, false).ToString());
+}
+
+// --- Tab registry implementation ---------------------------------------------
+
+// static
+void ExperimentClient::CreateTab(const std::string& url) {
+  CEF_REQUIRE_UI_THREAD();
+  DCHECK(g_parent_view);
+  CefWindowInfo window_info;
+  window_info.SetAsChild(g_parent_view, CefRect(0, 0, 1, 1));
+  CefBrowserSettings browser_settings;
+  CefBrowserHost::CreateBrowser(window_info, g_client, url, browser_settings,
+                                nullptr, nullptr);
 }
 
 // static
-CefRefPtr<CefBrowser> ExperimentClient::GetFirstBrowserForTesting() {
-  return g_first_browser;
+void ExperimentClient::CloseTabById(int browser_id) {
+  CEF_REQUIRE_UI_THREAD();
+  auto it = g_tabs.find(browser_id);
+  if (it != g_tabs.end()) {
+    // DoClose (called synchronously from here) removes the native view,
+    // which completes the teardown and triggers OnBeforeClose.
+    it->second->GetHost()->CloseBrowser(false);
+  }
 }
 
-bool ExperimentClient::DoClose(CefRefPtr<CefBrowser> browser) {
+// static
+void ExperimentClient::ActivateTab(int browser_id) {
   CEF_REQUIRE_UI_THREAD();
-  return false;  // Allow the close.
+  auto it = g_tabs.find(browser_id);
+  if (it == g_tabs.end()) {
+    return;
+  }
+  g_active_tab = browser_id;
+  CefRefPtr<CefBrowser> browser = it->second;
+
+  for (const auto& [id, other] : g_tabs) {
+    [BrowserNSView(other) setHidden:(id != browser_id)];
+  }
+  // Re-layout in case the sidebar was toggled while this tab was hidden.
+  LayoutBrowserView(browser);
+
+  SidebarSetActiveTab(browser_id);
+  StartViewSetVisible(false);
+
+  // Sync sidebar state to the newly active tab.
+  if (CefRefPtr<CefFrame> frame = browser->GetMainFrame()) {
+    SidebarSetAddressText(frame->GetURL().ToString());
+  }
+  SidebarSetLoadingState(browser->IsLoading(), browser->CanGoBack(),
+                         browser->CanGoForward());
+  browser->GetHost()->SetFocus(true);
 }
 
-void ExperimentClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
+// static
+CefRefPtr<CefBrowser> ExperimentClient::GetActiveBrowser() {
   CEF_REQUIRE_UI_THREAD();
-  if (g_first_browser && g_first_browser->IsSame(browser)) {
-    g_first_browser = nullptr;
+  auto it = g_tabs.find(g_active_tab);
+  return it != g_tabs.end() ? it->second : nullptr;
+}
+
+// static
+void ExperimentClient::CloseAllBrowsers() {
+  CEF_REQUIRE_UI_THREAD();
+  for (const auto& [id, browser] : g_tabs) {
+    browser->GetHost()->CloseBrowser(false);
   }
-  if (--browser_count_ == 0) {
-    CefQuitMessageLoop();
-  }
+}
+
+// static
+bool ExperimentClient::HasTabs() {
+  return !g_tabs.empty();
+}
+
+// static
+void ExperimentClient::SetTerminating() {
+  g_terminating = true;
+}
+
+bool ExperimentClient::IsActive(CefRefPtr<CefBrowser> browser) const {
+  return browser->GetIdentifier() == g_active_tab;
 }
 
 void ExperimentApp::OnBeforeCommandLineProcessing(
@@ -173,31 +273,29 @@ void ExperimentApp::OnBeforeCommandLineProcessing(
 
 void ExperimentApp::OnContextInitialized() {
   CEF_REQUIRE_UI_THREAD();
-
-  const std::string url = "https://example.com";
-
-  CefRefPtr<CefCommandLine> command_line =
-      CefCommandLine::GetGlobalCommandLine();
-  const bool use_views = command_line->HasSwitch("use-views");
-
-  CefRefPtr<ExperimentClient> client(new ExperimentClient());
-
-  if (use_views) {
-    // Views-framework path: CEF manages the window.
-    CefBrowserSettings browser_settings;
-    CefRefPtr<CefBrowserView> browser_view = CefBrowserView::CreateBrowserView(
-        client, url, browser_settings, nullptr, nullptr,
-        new ExperimentBrowserViewDelegate());
-    CefWindow::CreateTopLevelWindow(
-        new ExperimentWindowDelegate(browser_view));
-  } else {
-    // Embed the web view as a child of the NSWindow's contentView (set by
-    // main.mm). Future native chrome will shrink/reposition this view.
-    CefWindowInfo window_info;
-    window_info.SetAsChild(g_parent_view, CefRect(0, 0, 1200, 800));
-    CefBrowserSettings browser_settings;
-    CefBrowserHost::CreateBrowser(window_info, client, url, browser_settings,
-                                  nullptr, nullptr);
+  g_client = new ExperimentClient();
+  // Intentionally create NO browser here: the window starts empty (native
+  // start view), and the first tab is created by the user (⌘T / + New Tab).
+  // Exception: EXPERIMENT_START_URL opens tabs for testing — comma-separate
+  // multiple URLs to spawn several tabs at launch.
+  //   EXPERIMENT_START_URL=https://github.com,https://example.com
+  const char* env_url = std::getenv("EXPERIMENT_START_URL");
+  if (env_url && env_url[0]) {
+    std::string urls = env_url;
+    size_t pos = 0;
+    while (pos <= urls.size()) {
+      size_t comma = urls.find(',', pos);
+      std::string url = urls.substr(pos, comma == std::string::npos
+                                           ? std::string::npos
+                                           : comma - pos);
+      if (!url.empty()) {
+        ExperimentClient::CreateTab(url);
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      pos = comma + 1;
+    }
   }
 }
 

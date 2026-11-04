@@ -6,8 +6,13 @@
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
 
-// Minimal browser client: owns the browser lifecycle callbacks plus the
-// display/load callbacks that drive the native toolbar.
+// Browser client: owns per-browser lifecycle callbacks plus the display/load
+// callbacks that drive the native sidebar. One shared instance serves all
+// tabs (see g_client in experiment_app.mm).
+//
+// Tab registry: browsers are keyed by CefBrowser::GetIdentifier(). The
+// static methods below are the entire tab API used by the native chrome
+// (sidebar, menus). All must be called on the UI thread.
 class ExperimentClient : public CefClient,
                          public CefLifeSpanHandler,
                          public CefDisplayHandler,
@@ -19,8 +24,16 @@ class ExperimentClient : public CefClient,
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
 
-  // Used by main.mm's window delegate to close the browser on window close.
-  static CefRefPtr<CefBrowser> GetFirstBrowserForTesting();
+  // --- Tab registry (UI thread) -------------------------------------------
+  static void CreateTab(const std::string& url);
+  static void CloseTabById(int browser_id);
+  static void ActivateTab(int browser_id);
+  static CefRefPtr<CefBrowser> GetActiveBrowser();
+  static void CloseAllBrowsers();
+  static bool HasTabs();
+  // Once set, the last browser close quits the message loop. Needed because
+  // "no tabs" is a normal state (empty start) and must not quit the app.
+  static void SetTerminating();
 
   // CefLifeSpanHandler:
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
@@ -46,15 +59,24 @@ class ExperimentClient : public CefClient,
                        const CefString& url) override;
   void OnTitleChange(CefRefPtr<CefBrowser> browser,
                      const CefString& title) override;
+  void OnFaviconURLChange(
+      CefRefPtr<CefBrowser> browser,
+      const std::vector<CefString>& icon_urls) override;
 
   // CefLoadHandler:
   void OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
                             bool isLoading,
                             bool canGoBack,
                             bool canGoForward) override;
+  void OnLoadError(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   ErrorCode errorCode,
+                   const CefString& errorText,
+                   const CefString& failedUrl) override;
 
  private:
-  int browser_count_ = 0;
+  // Browser-id-keyed state shared across the (single) client instance.
+  bool IsActive(CefRefPtr<CefBrowser> browser) const;
 
   IMPLEMENT_REFCOUNTING(ExperimentClient);
   DISALLOW_COPY_AND_ASSIGN(ExperimentClient);

@@ -6,9 +6,11 @@
 #include "include/wrapper/cef_library_loader.h"
 
 #include "experiment_app.h"
-#include "toolbar.h"
+#include "sidebar.h"
+#include "theme.h"
 
-// Set by main.mm before CefInitialize; consumed in OnContextInitialized.
+// Set by main.mm before CefInitialize; consumed by ExperimentClient when
+// creating tabs.
 void SetParentViewForBrowser(void* view);
 
 // CEF requires the NSApplication object to conform to CefAppProtocol so it
@@ -32,213 +34,87 @@ void SetParentViewForBrowser(void* view);
 }
 @end
 
-// Native toolbar: back/forward/reload buttons plus a URL field, pinned to
-// the top of the window. Talks to CEF through GetFirstBrowserForTesting,
-// same as the menu actions — both get absorbed into a real controller
-// class once the UI grows.
-@interface ExperimentToolbar : NSObject <NSTextFieldDelegate> {
-  NSVisualEffectView* bar_;
-  NSButton* backButton_;
-  NSButton* forwardButton_;
-  NSButton* reloadButton_;
-  NSTextField* addressField_;
-}
-- (NSView*)view;
-- (void)setAddressText:(NSString*)url;
-- (void)setLoadingState:(BOOL)loading
-             canGoBack:(BOOL)canGoBack
-          canGoForward:(BOOL)canGoForward;
-@end
+// Start placeholder: shown in the content area when no tabs are open.
+static NSView* g_start_view = nil;
 
-@implementation ExperimentToolbar
-
-- (instancetype)init {
-  if ((self = [super init])) {
-    bar_ = [[NSVisualEffectView alloc] init];
-    [bar_ setMaterial:NSVisualEffectMaterialHeaderView];
-    // Pinned to the top of the contentView (bottom-origin coordinates, so
-    // the MinY margin stays flexible).
-    [bar_ setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
-
-    const CGFloat pad = 8;
-    const CGFloat buttonWidth = 32;
-    CGFloat x = pad;
-    backButton_ = [self makeButtonWithTitle:@"◀"
-                                     action:@selector(goBack:)
-                                      frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
-    x += buttonWidth + 4;
-    forwardButton_ = [self makeButtonWithTitle:@"▶"
-                                        action:@selector(goForward:)
-                                         frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
-    x += buttonWidth + 4;
-    reloadButton_ = [self makeButtonWithTitle:@"⟳"
-                                       action:@selector(reloadPage:)
-                                        frame:NSMakeRect(x, 4, buttonWidth, kToolbarHeight - 8)];
-    x += buttonWidth + pad;
-
-    const CGFloat fieldX = x;
-    addressField_ = [[NSTextField alloc]
-        initWithFrame:NSMakeRect(fieldX, 6, 600, kToolbarHeight - 12)];
-    [addressField_ setBezelStyle:NSTextFieldRoundedBezel];
-    [addressField_ setPlaceholderString:@"Search or enter address"];
-    [addressField_ setTarget:self];
-    [addressField_ setAction:@selector(addressEntered:)];
-    // Stretch with the bar, keeping the trailing margin fixed.
-    [addressField_ setAutoresizingMask:NSViewWidthSizable];
-    [bar_ addSubview:addressField_];
-  }
-  return self;
-}
-
-- (NSButton*)makeButtonWithTitle:(NSString*)title
-                          action:(SEL)action
-                           frame:(NSRect)frame {
-  NSButton* button = [[NSButton alloc] initWithFrame:frame];
-  [button setTitle:title];
-  [button setBezelStyle:NSBezelStyleRegularSquare];
-  [button setTarget:self];
-  [button setAction:action];
-  [button setAutoresizingMask:NSViewMaxXMargin];
-  [bar_ addSubview:button];
-  return button;
-}
-
-- (NSView*)view {
-  return bar_;
-}
-
-- (void)setAddressText:(NSString*)url {
-  // Don't stomp on text the user is actively editing.
-  if ([addressField_ currentEditor] == nil) {
-    [addressField_ setStringValue:url];
-  }
-}
-
-- (void)setLoadingState:(BOOL)loading
-             canGoBack:(BOOL)canGoBack
-          canGoForward:(BOOL)canGoForward {
-  [backButton_ setEnabled:canGoBack];
-  [forwardButton_ setEnabled:canGoForward];
-  [reloadButton_ setTitle:loading ? @"✕" : @"⟳"];
-}
-
-- (void)goBack:(id)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    browser->GoBack();
-  }
-}
-
-- (void)goForward:(id)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    browser->GoForward();
-  }
-}
-
-- (void)reloadPage:(id)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    if (browser->IsLoading()) {
-      browser->StopLoad();
-    } else {
-      browser->Reload();
-    }
-  }
-}
-
-- (void)addressEntered:(id)sender {
-  std::string text = [[addressField_ stringValue] UTF8String];
-  if (text.empty()) {
+void StartViewSetVisible(bool visible) {
+  if (!g_start_view) {
     return;
   }
-  // Bare input gets treated as a URL with an https:// prefix. (Search
-  // engine fallback comes later with an actual omnibox.)
-  if (text.find("://") == std::string::npos) {
-    text = "https://" + text;
+  if (visible) {
+    // Track sidebar visibility so the placeholder fills the content area.
+    NSRect bounds = [[g_start_view superview] bounds];
+    CGFloat x = SidebarIsHidden() ? 0 : kSidebarWidth;
+    [g_start_view setFrame:NSMakeRect(x, 0, bounds.size.width - x,
+                                      bounds.size.height)];
   }
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    browser->GetMainFrame()->LoadURL(text);
-  }
-}
-
-@end
-
-// Toolbar bridge used by the CEF client (see toolbar.h).
-static ExperimentToolbar* g_toolbar = nil;
-
-void ToolbarSetAddressText(const std::string& url) {
-  [g_toolbar setAddressText:[NSString stringWithUTF8String:url.c_str()]];
-}
-
-void ToolbarSetLoadingState(bool is_loading, bool can_go_back,
-                            bool can_go_forward) {
-  [g_toolbar setLoadingState:is_loading
-                  canGoBack:can_go_back
-               canGoForward:can_go_forward];
+  [g_start_view setHidden:!visible];
 }
 
 // Handles app lifecycle (clean quit) and menu actions that talk to CEF.
-// NOTE: this object is where "native UI → browser command" wiring should
-// accumulate; once more than a handful of actions exist, promote it (and the
-// g_first_browser global) into a real BrowserController class.
 @interface ExperimentAppDelegate : NSObject <NSApplicationDelegate,
                                              NSWindowDelegate>
 @end
 
 @implementation ExperimentAppDelegate
 
-// Cmd+Q / menu Quit: close browsers first; OnBeforeClose runs
+// Cmd+Q / menu Quit: close all browsers first; the last OnBeforeClose runs
 // CefQuitMessageLoop, after which main() calls CefShutdown and exits.
 - (NSApplicationTerminateReply)applicationShouldTerminate:
     (NSApplication*)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    browser->GetHost()->CloseBrowser(false);
+  ExperimentClient::SetTerminating();
+  if (ExperimentClient::HasTabs()) {
+    ExperimentClient::CloseAllBrowsers();
     return NSTerminateCancel;
   }
   return NSTerminateNow;
 }
 
-// Red close button: route through the browser close path (which quits the
-// app) instead of destroying the NSWindow out from under CEF.
+// Red close button: with a single window, closing it means quitting. Close
+// all browsers; the last one's OnBeforeClose quits the message loop. We
+// return NO (don't close the window yet) because browser teardown is
+// asynchronous — the process exits once all browsers are gone.
 - (BOOL)windowShouldClose:(NSWindow*)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
-    // TryCloseBrowser returns true if the close will proceed immediately
-    // (window may close now) and false if it's delayed by JavaScript unload
-    // handlers (keep the window open; CEF re-triggers the close when ready).
-    if (browser->GetHost()->TryCloseBrowser()) {
-      // Complete the browser close by tearing down the view hierarchy
-      // ourselves. We can't rely on NSWindow destruction for this: closing
-      // only hides the window, and in practice the window leaks anyway, so
-      // the browser view would never be destroyed and OnBeforeClose would
-      // never fire.
-      NSView* browserView =
-          (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-      [browserView removeFromSuperview];
-      return YES;
-    }
-    return NO;
+  ExperimentClient::SetTerminating();
+  if (ExperimentClient::HasTabs()) {
+    ExperimentClient::CloseAllBrowsers();
+  } else {
+    CefQuitMessageLoop();
   }
-  CefQuitMessageLoop();
   return NO;
 }
 
+// NOTE: JS beforeunload handlers are not honored on quit/close (CloseBrowser
+// bypasses them; TryCloseBrowser would defer). Revisit if we ever need it —
+// the experiment optimizes for predictable teardown.
+
+- (IBAction)newTab:(id)sender {
+  ExperimentClient::CreateTab("about:blank");
+}
+
+- (IBAction)closeTab:(id)sender {
+  if (CefRefPtr<CefBrowser> browser = ExperimentClient::GetActiveBrowser()) {
+    ExperimentClient::CloseTabById(browser->GetIdentifier());
+  } else {
+    [NSApp terminate:nil];
+  }
+}
+
 - (IBAction)reload:(id)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
+  if (CefRefPtr<CefBrowser> browser = ExperimentClient::GetActiveBrowser()) {
     browser->Reload();
   }
 }
 
 - (IBAction)toggleDevTools:(id)sender {
-  if (CefRefPtr<CefBrowser> browser =
-          ExperimentClient::GetFirstBrowserForTesting()) {
+  if (CefRefPtr<CefBrowser> browser = ExperimentClient::GetActiveBrowser()) {
     browser->GetHost()->ShowDevTools(CefWindowInfo(), new ExperimentClient(),
                                      CefBrowserSettings(), CefPoint());
   }
+}
+
+- (IBAction)toggleSidebar:(id)sender {
+  SidebarToggleHidden();
 }
 
 @end
@@ -256,6 +132,18 @@ NSMenu* CreateAppMenu(ExperimentAppDelegate* delegate) {
                      action:@selector(terminate:)
               keyEquivalent:@"q"];
   [appMenuItem setSubmenu:appMenu];
+
+  // File menu.
+  NSMenuItem* fileMenuItem = [[NSMenuItem alloc] init];
+  [menubar addItem:fileMenuItem];
+  NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+  [fileMenu addItemWithTitle:@"New Tab"
+                      action:@selector(newTab:)
+               keyEquivalent:@"t"];
+  [fileMenu addItemWithTitle:@"Close Tab"
+                      action:@selector(closeTab:)
+               keyEquivalent:@"w"];
+  [fileMenuItem setSubmenu:fileMenu];
 
   // Edit menu: required for copy/paste/select-all in web content, which the
   // Chromium NSView implements via standard responder selectors.
@@ -278,6 +166,12 @@ NSMenu* CreateAppMenu(ExperimentAppDelegate* delegate) {
   [viewMenu addItemWithTitle:@"Reload"
                       action:@selector(reload:)
                keyEquivalent:@"r"];
+  NSMenuItem* sidebarItem =
+      [viewMenu addItemWithTitle:@"Toggle Sidebar"
+                          action:@selector(toggleSidebar:)
+                   keyEquivalent:@"S"];  // uppercase when mask has shift
+  [sidebarItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand |
+                                            NSEventModifierFlagShift];
   NSMenuItem* devToolsItem =
       [viewMenu addItemWithTitle:@"Toggle Developer Tools"
                           action:@selector(toggleDevTools:)
@@ -297,13 +191,40 @@ NSMenu* CreateAppMenu(ExperimentAppDelegate* delegate) {
                         action:@selector(performZoom:)
                  keyEquivalent:@""];
   [windowMenu addItem:[NSMenuItem separatorItem]];
-  [windowMenu addItemWithTitle:@"Close Window"
-                        action:@selector(performClose:)
-                 keyEquivalent:@"w"];
+  NSMenuItem* closeWindowItem =
+      [windowMenu addItemWithTitle:@"Close Window"
+                            action:@selector(performClose:)
+                     keyEquivalent:@"W"];  // ⇧⌘W; ⌘W is Close Tab
+  [closeWindowItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand |
+                                                NSEventModifierFlagShift];
   [windowMenuItem setSubmenu:windowMenu];
   [NSApp setWindowsMenu:windowMenu];
 
   return menubar;
+}
+
+// Placeholder shown in the content area when no tabs are open.
+NSView* CreateStartView(NSRect bounds) {
+  NSView* view = [[NSView alloc] initWithFrame:bounds];
+  [view setWantsLayer:YES];
+  [[view layer] setBackgroundColor:[[NSColor colorWithWhite:0.12
+                                                      alpha:1] CGColor]];
+  [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+  NSTextField* label = [[NSTextField alloc]
+      initWithFrame:NSMakeRect(0, bounds.size.height / 2 - 12,
+                               bounds.size.width, 24)];
+  [label setEditable:NO];
+  [label setBezeled:NO];
+  [label setDrawsBackground:NO];
+  [label setAlignment:NSTextAlignmentCenter];
+  [label setFont:theme::RowTitleFont()];
+  [label setTextColor:theme::TextSecondary()];
+  [label setStringValue:@"⌘T for a new tab"];
+  [label setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin |
+                             NSViewMaxYMargin];
+  [view addSubview:label];
+  return view;
 }
 
 }  // namespace
@@ -333,31 +254,33 @@ int main(int argc, char* argv[]) {
                   styleMask:(NSWindowStyleMaskTitled |
                              NSWindowStyleMaskClosable |
                              NSWindowStyleMaskMiniaturizable |
-                             NSWindowStyleMaskResizable)
+                             NSWindowStyleMaskResizable |
+                             NSWindowStyleMaskFullSizeContentView)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     [window setTitle:@"Experiment"];
+    // Chromeless window: hide the titlebar so the traffic lights float over
+    // the sidebar, Arc-style. Content extends under the titlebar area.
+    [window setTitlebarAppearsTransparent:YES];
+    [window setTitleVisibility:NSWindowTitleHidden];
     [window center];
     [window setDelegate:delegate];
-    // The browser's teardown (step 9 of the DoClose contract) is triggered
-    // by DESTRUCTION of the top-level window's view hierarchy, not merely
-    // by closing it. Default NSWindow close behavior only hides the window,
-    // which would leave the browser half-closed and OnBeforeClose would
-    // never fire. So: release-on-close, and don't hold our own strong ref.
+    [window setMinSize:NSMakeSize(kSidebarWidth + 240, 225)];
     [window setReleasedWhenClosed:YES];
 
-    // The web content renders into this view. Native chrome (tab strip,
-    // sidebar) will later be added as sibling subviews of the contentView.
     NSView* contentView = [window contentView];
     SetParentViewForBrowser(contentView);
 
-    // Toolbar strip across the top; the browser view is laid out below it
-    // in OnAfterCreated.
-    g_toolbar = [[ExperimentToolbar alloc] init];
-    NSView* toolbarView = [g_toolbar view];
-    [toolbarView setFrame:NSMakeRect(0, frame.size.height - kToolbarHeight,
-                                     frame.size.width, kToolbarHeight)];
-    [contentView addSubview:toolbarView];
+    // Empty-start placeholder; hidden once the first tab opens.
+    NSRect startFrame = NSMakeRect(kSidebarWidth, 0,
+                                   frame.size.width - kSidebarWidth,
+                                   frame.size.height);
+    g_start_view = CreateStartView(startFrame);
+    [contentView addSubview:g_start_view];
+
+    // Sidebar pinned to the left edge, full height (it also underlays the
+    // traffic lights in the hidden-titlebar area).
+    SidebarCreate(contentView, frame.size.height);
 
     CefSettings settings;
     settings.no_sandbox = true;
