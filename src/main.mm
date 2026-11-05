@@ -34,21 +34,15 @@ void SetParentViewForBrowser(void* view);
 }
 @end
 
-// Start placeholder: shown in the content area when no tabs are open.
+// App surface: the vibrant-material backdrop the web view card sits on.
+// Always visible; only the empty-state card (rounded placeholder with the
+// "no tabs" hint) toggles via StartViewSetVisible.
 static NSView* g_start_view = nil;
+static NSView* g_start_card = nil;
+static NSTextField* g_start_label = nil;
 
 void StartViewSetVisible(bool visible) {
-  if (!g_start_view) {
-    return;
-  }
-  if (visible) {
-    // Track sidebar visibility so the placeholder fills the content area.
-    NSRect bounds = [[g_start_view superview] bounds];
-    CGFloat x = SidebarIsHidden() ? 0 : kSidebarWidth;
-    [g_start_view setFrame:NSMakeRect(x, 0, bounds.size.width - x,
-                                      bounds.size.height)];
-  }
-  [g_start_view setHidden:!visible];
+  [g_start_card setHidden:!visible];
 }
 
 // Handles app lifecycle (clean quit) and menu actions that talk to CEF.
@@ -203,27 +197,57 @@ NSMenu* CreateAppMenu(ExperimentAppDelegate* delegate) {
   return menubar;
 }
 
-// Placeholder shown in the content area when no tabs are open.
+// App surface + empty-state card. The surface is the vibrant-material
+// backdrop the web view card sits on (always visible). On top of it sits
+// the empty-state card: a lighter, rounded vibrant view inset exactly like
+// the web view card, so the empty window previews where content will
+// appear. StartViewSetVisible toggles the card (and its hint label).
 NSView* CreateStartView(NSRect bounds) {
-  NSView* view = [[NSView alloc] initWithFrame:bounds];
-  [view setWantsLayer:YES];
-  [[view layer] setBackgroundColor:[[NSColor colorWithWhite:0.12
-                                                      alpha:1] CGColor]];
+  NSVisualEffectView* view = [[NSVisualEffectView alloc] initWithFrame:bounds];
+  [view setMaterial:NSVisualEffectMaterialSidebar];
+  [view setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
   [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 
-  NSTextField* label = [[NSTextField alloc]
-      initWithFrame:NSMakeRect(0, bounds.size.height / 2 - 12,
-                               bounds.size.width, 24)];
-  [label setEditable:NO];
-  [label setBezeled:NO];
-  [label setDrawsBackground:NO];
-  [label setAlignment:NSTextAlignmentCenter];
-  [label setFont:theme::RowTitleFont()];
-  [label setTextColor:theme::TextSecondary()];
-  [label setStringValue:@"⌘T for a new tab"];
-  [label setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin |
-                             NSViewMaxYMargin];
-  [view addSubview:label];
+  // The card mirrors LayoutBrowserView's geometry (minus the sidebar-left
+  // offset, which is constant here).
+  const CGFloat pad = kWebViewPadding;
+  NSRect cardFrame = NSMakeRect(kSidebarWidth + pad, pad,
+                                bounds.size.width - kSidebarWidth - 2 * pad,
+                                bounds.size.height - 2 * pad);
+  NSVisualEffectView* card =
+      [[NSVisualEffectView alloc] initWithFrame:cardFrame];
+  [card setMaterial:NSVisualEffectMaterialPopover];
+  [card setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+  [card setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  [card setWantsLayer:YES];
+  [[card layer] setCornerRadius:kWebViewCornerRadius];
+  [[card layer] setMasksToBounds:YES];
+  [view addSubview:card];
+
+  // The blur materials alone barely differ from the surface on busy
+  // wallpapers, so lift the card with a subtle white overlay.
+  NSView* lift = [[NSView alloc] initWithFrame:[card bounds]];
+  [lift setWantsLayer:YES];
+  [[lift layer]
+      setBackgroundColor:[[NSColor colorWithWhite:1.0 alpha:0.08] CGColor]];
+  [lift setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  [card addSubview:lift];
+
+  g_start_label = [[NSTextField alloc]
+      initWithFrame:NSMakeRect(0, cardFrame.size.height / 2 - 12,
+                               cardFrame.size.width, 24)];
+  [g_start_label setEditable:NO];
+  [g_start_label setBezeled:NO];
+  [g_start_label setDrawsBackground:NO];
+  [g_start_label setAlignment:NSTextAlignmentCenter];
+  [g_start_label setFont:[NSFont systemFontOfSize:13
+                                         weight:NSFontWeightMedium]];
+  [g_start_label setTextColor:[NSColor tertiaryLabelColor]];
+  [g_start_label setStringValue:@"⌘T for a new tab"];
+  [g_start_label setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin |
+                                     NSViewMaxYMargin];
+  [card addSubview:g_start_label];
+  g_start_card = card;
   return view;
 }
 
@@ -271,11 +295,10 @@ int main(int argc, char* argv[]) {
     NSView* contentView = [window contentView];
     SetParentViewForBrowser(contentView);
 
-    // Empty-start placeholder; hidden once the first tab opens.
-    NSRect startFrame = NSMakeRect(kSidebarWidth, 0,
-                                   frame.size.width - kSidebarWidth,
-                                   frame.size.height);
-    g_start_view = CreateStartView(startFrame);
+    // App surface: spans the full content area (the sidebar floats over
+    // the left edge; same material, so it reads as one surface). The hint
+    // label hides once the first tab opens.
+    g_start_view = CreateStartView([contentView bounds]);
     [contentView addSubview:g_start_view];
 
     // Sidebar pinned to the left edge, full height (it also underlays the
@@ -305,6 +328,20 @@ int main(int argc, char* argv[]) {
 
     if (!CefInitialize(main_args, settings, app.get(), nullptr)) {
       return 1;
+    }
+
+    // Test hook: EXPERIMENT_AUTOCLOSE_SEC=5 closes the active tab after 5s,
+    // for screenshot-verifying the no-tabs state without input injection.
+    if (const char* secs = getenv("EXPERIMENT_AUTOCLOSE_SEC")) {
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW,
+                        (int64_t)(atof(secs) * NSEC_PER_SEC)),
+          dispatch_get_main_queue(), ^{
+            if (CefRefPtr<CefBrowser> b =
+                    ExperimentClient::GetActiveBrowser()) {
+              ExperimentClient::CloseTabById(b->GetIdentifier());
+            }
+          });
     }
 
     [window makeKeyAndOrderFront:nil];

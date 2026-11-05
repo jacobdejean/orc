@@ -16,18 +16,179 @@
 // sidebar's height at construction time and pinned with NSViewMinYMargin.
 // ---------------------------------------------------------------------------
 namespace {
-constexpr CGFloat kNavRowTopInset = 10;    // below the traffic lights
+// Sidebar layout metrics. All coordinates are bottom-left origin; "top of
+// sidebar" frames are computed from the sidebar's height at construction
+// time and pinned with NSViewMinYMargin.
+constexpr CGFloat kNavRowTopInset = 6;    // below the traffic lights
 constexpr CGFloat kNavButtonSize = 24;
-constexpr CGFloat kNavButtonSpacing = 6;
-constexpr CGFloat kNavRowLeftInset = 76;   // clears the traffic light cluster
-constexpr CGFloat kAddressTopSpacing = 8;  // gap between nav row and field
-constexpr CGFloat kAddressHeight = 28;
+constexpr CGFloat kNavSymbolSize = 18;    // nav icon glyph size (pt)
+constexpr CGFloat kNavButtonSpacing = 8;
+constexpr CGFloat kNavRowLeftInset = 80;  // clears the traffic light cluster
+constexpr CGFloat kAddressTopSpacing = 10;
+constexpr CGFloat kAddressHeight = 36;
 constexpr CGFloat kTabListTopSpacing = 16;
 constexpr CGFloat kTabRowHeight = 28;
 constexpr CGFloat kFaviconSize = 16;
-constexpr CGFloat kFaviconLeftInset = 6;
+constexpr CGFloat kFaviconLeftInset = 8;
 constexpr CGFloat kCloseButtonSize = 16;
+constexpr CGFloat kAddressTextInset = 8;
+constexpr CGFloat kAddressIconSize = 16;  // magnifier glyph size (pt)
+constexpr CGFloat kAddressIconGap = 5;
 }  // namespace
+
+// AddressField: a container view that draws the rounded dark pill and the
+// magnifier icon, and hosts a real borderless NSTextField centered
+// vertically inside it. Layout is done with plain views because modern
+// AppKit ignores NSTextFieldCell text/titleRectForBounds overrides when
+// drawing — the field-editor path alone can't be styled reliably.
+@interface AddressFieldIconView : NSImageView
+@end
+
+@implementation AddressFieldIconView
+- (NSView*)hitTest:(NSPoint)point {
+  return nil;  // clicks fall through to the field
+}
+@end
+
+@interface AddressField : NSView
+- (NSTextField*)textField;
+- (void)focusField;
+@end
+
+@implementation AddressField {
+  NSTextField* field_;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  if ((self = [super initWithFrame:frame])) {
+    NSImage* icon = [[NSImage imageWithSystemSymbolName:@"magnifyingglass"
+                               accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration
+            configurationWithPointSize:kAddressIconSize
+                                weight:NSFontWeightRegular]];
+    AddressFieldIconView* iconView = [[AddressFieldIconView alloc]
+        initWithFrame:NSMakeRect(kAddressTextInset,
+                                 floor((NSHeight(frame) - kAddressIconSize) /
+                                       2),
+                                 kAddressIconSize, kAddressIconSize)];
+    [iconView setImage:icon];
+    [iconView setContentTintColor:theme::TextSecondary()];
+    [iconView setAutoresizingMask:NSViewMaxXMargin];
+    [self addSubview:iconView];
+
+    NSFont* font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+    const CGFloat lineHeight =
+        ceil([font ascender] - [font descender] + [font leading]);
+    const CGFloat textX =
+        kAddressTextInset + kAddressIconSize + kAddressIconGap;
+    field_ = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(textX,
+                                 floor((NSHeight(frame) - lineHeight) / 2),
+                                 NSWidth(frame) - textX - kAddressTextInset,
+                                 lineHeight)];
+    [field_ setFont:font];
+    [field_ setBezeled:NO];
+    [field_ setDrawsBackground:NO];
+    [field_ setEditable:YES];
+    [field_ setFocusRingType:NSFocusRingTypeNone];
+    [[field_ cell] setScrollable:YES];
+    [[field_ cell] setWraps:NO];
+    [field_ setAutoresizingMask:NSViewWidthSizable];
+    [self addSubview:field_];
+  }
+  return self;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  [theme::RowBackgroundHover() setFill];
+  [[NSBezierPath bezierPathWithRoundedRect:[self bounds]
+                                   xRadius:theme::CornerRadiusRow()
+                                   yRadius:theme::CornerRadiusRow()] fill];
+  [super drawRect:dirtyRect];
+}
+
+// Clicking the pill anywhere focuses the inner field.
+- (void)mouseDown:(NSEvent*)event {
+  [self focusField];
+}
+
+- (NSTextField*)textField {
+  return field_;
+}
+
+- (void)focusField {
+  [[self window] makeFirstResponder:field_];
+}
+
+// NSTextField API used by the sidebar, forwarded to the inner field.
+- (void)setTarget:(id)target {
+  [field_ setTarget:target];
+}
+- (void)setAction:(SEL)action {
+  [field_ setAction:action];
+}
+- (void)setDelegate:(id<NSTextFieldDelegate>)delegate {
+  [field_ setDelegate:delegate];
+}
+- (void)setPlaceholderString:(NSString*)placeholder {
+  [field_ setPlaceholderString:placeholder];
+}
+- (void)setStringValue:(NSString*)value {
+  [field_ setStringValue:value];
+}
+- (NSString*)stringValue {
+  return [field_ stringValue];
+}
+- (NSText*)currentEditor {
+  return [field_ currentEditor];
+}
+- (BOOL)abortEditing {
+  return [field_ abortEditing];
+}
+@end
+
+// Tab row button: handles hover background. Active state wins over hover.
+@interface TabRowButton : NSButton
+@property(nonatomic) BOOL active;
+@property(nonatomic) BOOL hovered;
+- (void)refreshBackground;
+@end
+
+@implementation TabRowButton
+- (instancetype)initWithFrame:(NSRect)frame {
+  if ((self = [super initWithFrame:frame])) {
+    [self setWantsLayer:YES];
+    [[self layer] setCornerRadius:theme::CornerRadiusRow()];
+  }
+  return self;
+}
+- (void)updateTrackingAreas {
+  [super updateTrackingAreas];
+  for (NSTrackingArea* area in [self trackingAreas]) {
+    [self removeTrackingArea:area];
+  }
+  NSTrackingArea* area = [[NSTrackingArea alloc]
+      initWithRect:[self bounds]
+           options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+             owner:self
+          userInfo:nil];
+  [self addTrackingArea:area];
+}
+- (void)mouseEntered:(NSEvent*)event {
+  _hovered = YES;
+  [self refreshBackground];
+}
+- (void)mouseExited:(NSEvent*)event {
+  _hovered = NO;
+  [self refreshBackground];
+}
+- (void)refreshBackground {
+  CGColorRef color =
+      _active ? [theme::RowBackgroundActive() CGColor]
+              : (_hovered ? [theme::RowBackgroundHover() CGColor] : nullptr);
+  [[self layer] setBackgroundColor:color];
+}
+@end
 
 // Sidebar background view: empty areas drag the window (like Arc), while
 // clicks on actual controls (subviews) pass through normally.
@@ -47,7 +208,7 @@ constexpr CGFloat kCloseButtonSize = 16;
   int tabId;
   NSString* title;
   NSString* faviconURL;  // last favicon URL, to avoid refetching
-  NSButton* row;
+  TabRowButton* row;
   NSImageView* faviconView;
   NSTextField* label;
   NSButton* closeButton;
@@ -62,10 +223,10 @@ constexpr CGFloat kCloseButtonSize = 16;
   NSButton* backButton_;
   NSButton* forwardButton_;
   NSButton* reloadButton_;
-  NSTextField* addressField_;
+  AddressField* addressField_;
   NSView* rowsContainer_;       // holds tab rows + the New Tab row
   NSMutableArray<TabRow*>* rows_;
-  NSView* newTabRow_;
+  TabRowButton* newTabRow_;
   int activeTabId_;
   NSString* lastCommittedURL_;  // for Esc-revert in the address field
 }
@@ -104,26 +265,25 @@ constexpr CGFloat kCloseButtonSize = 16;
     CGFloat y = height - kNavRowTopInset - kNavButtonSize;
 
     CGFloat x = kNavRowLeftInset;
-    backButton_ = [self makeButtonWithTitle:@"◀"
-                                     action:@selector(goBack:)
-                                      frame:NSMakeRect(x, y, kNavButtonSize,
-                                                       kNavButtonSize)];
+    backButton_ = [self makeButtonWithSymbol:@"arrow.left"
+                                      action:@selector(goBack:)
+                                       frame:NSMakeRect(x, y, kNavButtonSize,
+                                                        kNavButtonSize)];
     x += kNavButtonSize + kNavButtonSpacing;
-    forwardButton_ = [self makeButtonWithTitle:@"▶"
-                                        action:@selector(goForward:)
+    forwardButton_ = [self makeButtonWithSymbol:@"arrow.right"
+                                         action:@selector(goForward:)
+                                          frame:NSMakeRect(x, y, kNavButtonSize,
+                                                           kNavButtonSize)];
+    x += kNavButtonSize + kNavButtonSpacing;
+    reloadButton_ = [self makeButtonWithSymbol:@"arrow.clockwise"
+                                        action:@selector(reloadPage:)
                                          frame:NSMakeRect(x, y, kNavButtonSize,
                                                           kNavButtonSize)];
-    x += kNavButtonSize + kNavButtonSpacing;
-    reloadButton_ = [self makeButtonWithTitle:@"⟳"
-                                       action:@selector(reloadPage:)
-                                        frame:NSMakeRect(x, y, kNavButtonSize,
-                                                         kNavButtonSize)];
 
     y -= kAddressTopSpacing + kAddressHeight;
-    addressField_ = [[NSTextField alloc]
+    addressField_ = [[AddressField alloc]
         initWithFrame:NSMakeRect(pad, y, w - 2 * pad, kAddressHeight)];
-    [addressField_ setBezelStyle:NSTextFieldRoundedBezel];
-    [addressField_ setPlaceholderString:@"Search or enter address"];
+    [addressField_ setPlaceholderString:@"Search or enter URL"];
     [addressField_ setTarget:self];
     [addressField_ setAction:@selector(addressEntered:)];
     [addressField_ setDelegate:self];
@@ -148,30 +308,93 @@ constexpr CGFloat kCloseButtonSize = 16;
   return self;
 }
 
-- (NSButton*)makeButtonWithTitle:(NSString*)title
-                          action:(SEL)action
-                           frame:(NSRect)frame {
-  NSButton* button = [[NSButton alloc] initWithFrame:frame];
-  [button setTitle:title];
-  [button setBezelStyle:NSBezelStyleRegularSquare];
+- (NSButton*)makeButtonWithSymbol:(NSString*)symbolName
+                             action:(SEL)action
+                              frame:(NSRect)frame {
+  TabRowButton* button = [[TabRowButton alloc] initWithFrame:frame];
+  [button setTitle:@""];
+  [button setBordered:NO];
   [button setTarget:self];
   [button setAction:action];
   [button setAutoresizingMask:NSViewMinYMargin];
+
+  // The glyph is an NSImageView subview: NSButton's own image drawing
+  // clips full-height symbols (arrow.clockwise) at the bottom edge.
+  NSImage* image = [NSImage imageWithSystemSymbolName:symbolName
+                             accessibilityDescription:nil];
+  NSImageSymbolConfiguration* config = [NSImageSymbolConfiguration
+      configurationWithPointSize:kNavSymbolSize
+                          weight:NSFontWeightRegular];
+  NSImageView* icon = [[NSImageView alloc]
+      initWithFrame:NSMakeRect((frame.size.width - kNavSymbolSize) / 2,
+                               (frame.size.height - kNavSymbolSize) / 2,
+                               kNavSymbolSize, kNavSymbolSize)];
+  [icon setImage:[image imageWithSymbolConfiguration:config]];
+  [icon setContentTintColor:theme::TextSecondary()];
+  [icon setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin |
+                            NSViewMinYMargin | NSViewMaxYMargin];
+  [icon setTag:1];
+  [button addSubview:icon];
   [view_ addSubview:button];
   return button;
 }
 
-- (NSView*)makeNewTabRow {
-  NSButton* row = [[NSButton alloc] initWithFrame:NSZeroRect];
-  [row setTitle:@"+  New Tab"];
-  [row setBordered:NO];
-  [row setAlignment:NSTextAlignmentLeft];
-  [row setFont:theme::RowTitleFont()];
-  [row setContentTintColor:theme::TextSecondary()];
-  [row setTarget:self];
-  [row setAction:@selector(newTab:)];
-  [row setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
-  return row;
+// Helper: a row label sized to one line and vertically centered in the row.
+- (NSTextField*)makeRowLabelWithX:(CGFloat)x width:(CGFloat)width {
+  NSFont* font = theme::RowTitleFont();
+  const CGFloat lineHeight =
+      ceil([font ascender] - [font descender] + [font leading]);
+  NSTextField* label = [[NSTextField alloc]
+      initWithFrame:NSMakeRect(x, floor((kTabRowHeight - lineHeight) / 2),
+                               width, lineHeight)];
+  [label setEditable:NO];
+  [label setBezeled:NO];
+  [label setDrawsBackground:NO];
+  [label setFont:font];
+  [label setAlignment:NSTextAlignmentLeft];
+  [label setLineBreakMode:NSLineBreakByTruncatingTail];
+  [[label cell] setWraps:NO];
+  [label setMaximumNumberOfLines:1];
+  [label setAutoresizingMask:NSViewWidthSizable];
+  return label;
+}
+
+// Helper: an SF Symbol image at the standard 16pt chrome size.
+- (NSImage*)chromeSymbol:(NSString*)name {
+  return [[NSImage imageWithSystemSymbolName:name
+                    accessibilityDescription:nil]
+      imageWithSymbolConfiguration:[NSImageSymbolConfiguration
+          configurationWithPointSize:16
+                              weight:NSFontWeightRegular]];
+}
+
+// "+ New Tab" row, laid out like a tab row: plus icon at the favicon spot,
+// label where titles sit.
+- (TabRowButton*)makeNewTabRow {
+  newTabRow_ = [[TabRowButton alloc] initWithFrame:NSZeroRect];
+  [newTabRow_ setTitle:@""];
+  [newTabRow_ setBordered:NO];
+  [newTabRow_ setTarget:self];
+  [newTabRow_ setAction:@selector(newTab:)];
+  [newTabRow_ setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+
+  NSImageView* icon = [[NSImageView alloc]
+      initWithFrame:NSMakeRect(kFaviconLeftInset,
+                               (kTabRowHeight - kFaviconSize) / 2,
+                               kFaviconSize, kFaviconSize)];
+  [icon setImage:[self chromeSymbol:@"plus"]];
+  [icon setContentTintColor:theme::TextSecondary()];
+  [icon setImageScaling:NSImageScaleProportionallyUpOrDown];
+  [newTabRow_ addSubview:icon];
+
+  const CGFloat titleX =
+      kFaviconLeftInset + kFaviconSize + theme::SpacingS();
+  NSTextField* label = [self makeRowLabelWithX:titleX
+                                         width:300];  // clipped by the row
+  [label setStringValue:@"New Tab"];
+  [label setTextColor:theme::TextSecondary()];
+  [newTabRow_ addSubview:label];
+  return newTabRow_;
 }
 
 - (NSView*)view {
@@ -195,15 +418,13 @@ constexpr CGFloat kCloseButtonSize = 16;
   tab->title = @"New Tab";
 
   const CGFloat w = [rowsContainer_ bounds].size.width;
-  tab->row = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, w,
-                                                        kTabRowHeight)];
+  tab->row = [[TabRowButton alloc] initWithFrame:NSMakeRect(0, 0, w,
+                                                            kTabRowHeight)];
   [tab->row setTitle:@""];  // default NSButton title is literally "Button"
   [tab->row setBordered:NO];
   [tab->row setTarget:self];
   [tab->row setAction:@selector(selectTab:)];
   [tab->row setTag:tabId];
-  [tab->row setWantsLayer:YES];
-  [[tab->row layer] setCornerRadius:theme::CornerRadiusRow()];
   [tab->row setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
 
   tab->faviconView = [[NSImageView alloc]
@@ -215,22 +436,11 @@ constexpr CGFloat kCloseButtonSize = 16;
 
   const CGFloat titleX =
       kFaviconLeftInset + kFaviconSize + theme::SpacingS();
-  tab->label = [[NSTextField alloc]
-      initWithFrame:NSMakeRect(titleX, 0,
-                               w - titleX - kCloseButtonSize -
-                                   theme::SpacingS(),
-                               kTabRowHeight)];
-  [tab->label setEditable:NO];
-  [tab->label setBezeled:NO];
-  [tab->label setDrawsBackground:NO];
-  [tab->label setFont:theme::RowTitleFont()];
+  tab->label = [self makeRowLabelWithX:titleX
+                                 width:w - titleX - kCloseButtonSize -
+                                       theme::SpacingS()];
   [tab->label setTextColor:theme::TextPrimary()];
-  [tab->label setAlignment:NSTextAlignmentLeft];
   [tab->label setStringValue:tab->title];
-  [tab->label setLineBreakMode:NSLineBreakByTruncatingTail];
-  [[tab->label cell] setWraps:NO];
-  [tab->label setMaximumNumberOfLines:1];
-  [tab->label setAutoresizingMask:NSViewWidthSizable];
   [tab->row addSubview:tab->label];
 
   tab->closeButton = [[NSButton alloc]
@@ -253,7 +463,7 @@ constexpr CGFloat kCloseButtonSize = 16;
 }
 
 - (void)focusAddressField {
-  [[addressField_ window] makeFirstResponder:addressField_];
+  [addressField_ focusField];
 }
 
 - (void)removeTabWithId:(int)tabId {
@@ -274,10 +484,8 @@ constexpr CGFloat kCloseButtonSize = 16;
     [addressField_ abortEditing];
   }
   for (TabRow* tab in rows_) {
-    const BOOL active = (tab->tabId == tabId);
-    CGColorRef color =
-        active ? [theme::RowBackgroundActive() CGColor] : nullptr;
-    [[tab->row layer] setBackgroundColor:color];
+    [tab->row setActive:(tab->tabId == tabId)];
+    [tab->row refreshBackground];
   }
 }
 
@@ -343,7 +551,13 @@ constexpr CGFloat kCloseButtonSize = 16;
           canGoForward:(BOOL)canGoForward {
   [backButton_ setEnabled:canGoBack];
   [forwardButton_ setEnabled:canGoForward];
-  [reloadButton_ setTitle:loading ? @"✕" : @"⟳"];
+  NSImage* reloadImage = [[NSImage
+        imageWithSystemSymbolName:loading ? @"xmark" : @"arrow.clockwise"
+         accessibilityDescription:nil]
+      imageWithSymbolConfiguration:[NSImageSymbolConfiguration
+          configurationWithPointSize:kNavSymbolSize
+                              weight:NSFontWeightRegular]];
+  [(NSImageView*)[reloadButton_ viewWithTag:1] setImage:reloadImage];
 }
 
 // Clicking into the field selects everything (Arc/Chrome behavior).
@@ -404,17 +618,31 @@ constexpr CGFloat kCloseButtonSize = 16;
 }
 
 - (void)addressEntered:(id)sender {
-  std::string text = [[addressField_ stringValue] UTF8String];
+  NSString* input = [addressField_ stringValue];
+  std::string text = [input UTF8String];
   if (text.empty()) {
     return;
   }
-  // Bare input gets treated as a URL with an https:// prefix. (Search
-  // engine fallback comes later with an actual omnibox.)
-  if (text.find("://") == std::string::npos) {
+  // URL-like input (has a scheme, or looks like a domain) navigates
+  // directly; anything else falls back to a DuckDuckGo search.
+  const bool hasScheme = text.find("://") != std::string::npos;
+  const bool looksLikeDomain =
+      [input rangeOfString:@"."].location != NSNotFound &&
+      [input rangeOfString:@" "].location == NSNotFound;
+  if (!hasScheme && !looksLikeDomain) {
+    NSString* encoded = [input
+        stringByAddingPercentEncodingWithAllowedCharacters:
+            [NSCharacterSet URLQueryAllowedCharacterSet]];
+    text = std::string("https://duckduckgo.com/?q=") + [encoded UTF8String];
+  } else if (!hasScheme) {
     text = "https://" + text;
   }
   if (CefRefPtr<CefBrowser> browser = ExperimentClient::GetActiveBrowser()) {
     browser->GetMainFrame()->LoadURL(text);
+  } else {
+    // No tab open: the address bar acts as the entry point for the first
+    // tab (Arc behaves the same).
+    ExperimentClient::CreateTab(text);
   }
 }
 
@@ -478,11 +706,6 @@ void SidebarToggleHidden() {
   BOOL hiding = ![sidebarView isHidden];
   [sidebarView setHidden:hiding];
   if (CefRefPtr<CefBrowser> browser = ExperimentClient::GetActiveBrowser()) {
-    NSView* browserView =
-        (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-    NSRect bounds = [[browserView superview] bounds];
-    CGFloat x = hiding ? 0 : kSidebarWidth;
-    [browserView setFrame:NSMakeRect(x, 0, bounds.size.width - x,
-                                     bounds.size.height)];
+    LayoutBrowserView(browser);
   }
 }

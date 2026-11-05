@@ -113,7 +113,8 @@ heights, insets) are constants at the top of `main.mm`.
 5. ~~Multiple tabs (browser registry keyed by `CefBrowser::GetIdentifier`,
    per-tab title/favicon, click-to-switch, ✕ close, ⌘T/⌘W, popups open as
    tabs) + empty-window start (no browser until first tab)~~ ✔
-6. Polish / styling (hover states, pinned tabs, quit-confirmation dialog à
+6. Polish / styling (~~hover states~~ ✔, ~~Arc-style URL field + faded
+   empty-window view~~ ✔, pinned tabs, quit-confirmation dialog à
    la Arc — standard NSAlert first, custom floating card later, "don't ask
    again" via NSUserDefaults; scrollable tab list when it overflows)
 7. (Later) consider a Rust port for safety, once the CEF lifecycle and macOS

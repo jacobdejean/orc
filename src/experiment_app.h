@@ -6,6 +6,10 @@
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
 
+// Frames the browser's native view within the content area, honoring
+// sidebar visibility and the kWebViewPadding card inset (sidebar.h).
+void LayoutBrowserView(CefRefPtr<CefBrowser> browser);
+
 // Browser client: owns per-browser lifecycle callbacks plus the display/load
 // callbacks that drive the native sidebar. One shared instance serves all
 // tabs (see g_client in experiment_app.mm).

@@ -24,24 +24,28 @@ bool g_terminating = false;
 // One client instance shared by all tabs; keeps handler wiring trivial.
 CefRefPtr<ExperimentClient> g_client;
 
-// Lays out a browser's native view in the content area (right of the
-// sidebar, or full width when the sidebar is hidden) and sizes it to track
-// window resizes.
-void LayoutBrowserView(CefRefPtr<CefBrowser> browser) {
-  NSView* browserView =
-      (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-  [browserView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  NSRect bounds = [[browserView superview] bounds];
-  CGFloat x = SidebarIsHidden() ? 0 : kSidebarWidth;
-  [browserView setFrame:NSMakeRect(x, 0, bounds.size.width - x,
-                                   bounds.size.height)];
-}
-
 NSView* BrowserNSView(CefRefPtr<CefBrowser> browser) {
   return (__bridge NSView*)browser->GetHost()->GetWindowHandle();
 }
 
 }  // namespace
+
+// Lays out a browser's native view in the content area: right of the
+// sidebar (or full width when hidden), inset by kWebViewPadding with
+// rounded card corners. Padding 0 = clean edges, no rounding.
+void LayoutBrowserView(CefRefPtr<CefBrowser> browser) {
+  NSView* browserView = BrowserNSView(browser);
+  [browserView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  NSRect bounds = [[browserView superview] bounds];
+  const CGFloat left = SidebarIsHidden() ? 0 : kSidebarWidth;
+  const CGFloat pad = kWebViewPadding;
+  [browserView setFrame:NSMakeRect(left + pad, pad,
+                                   bounds.size.width - left - 2 * pad,
+                                   bounds.size.height - 2 * pad)];
+  [browserView setWantsLayer:YES];
+  [[browserView layer] setCornerRadius:pad > 0 ? kWebViewCornerRadius : 0];
+  [[browserView layer] setMasksToBounds:pad > 0];
+}
 
 bool ExperimentClient::OnBeforePopup(
     CefRefPtr<CefBrowser> browser,
