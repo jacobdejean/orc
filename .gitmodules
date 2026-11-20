@@ -1,0 +1,3 @@
+[submodule "experiment2/ungoogled-chromium-macos"]
+	path = experiment2/ungoogled-chromium-macos
+	url = https://github.com/jacobdejean/ungoogled-chromium-macos.git
